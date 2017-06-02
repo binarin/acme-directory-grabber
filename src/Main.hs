@@ -7,7 +7,10 @@
 {-# LANGUAGE FunctionalDependencies #-}
 {-# LANGUAGE FlexibleInstances #-}
 
+import Control.Exception
 import qualified GHC.Word
+import Data.Time.Format
+import Data.Time
 import System.Environment (withArgs)
 import Control.Concurrent (threadDelay)
 import qualified Options.Applicative as Opt
@@ -132,6 +135,9 @@ refreshBackupCodes config = do
 
 fetchTodaysDirectory :: Config -> Text -> IO ()
 fetchTodaysDirectory cfg rawCookie = do
+  ts <- formatTime defaultTimeLocale "%Y%m%d%H%M%S" <$> getCurrentTime
+  json <- fetchDirectory cfg rawCookie
+  BL.writeFile ("directory-" <> ts) json
   return ()
 
 extractToken :: Text -> B.ByteString
@@ -161,7 +167,7 @@ countCodesLeft config = do
 withWebDriver :: Cmdline -> (WDSession -> IO a) -> IO a
 withWebDriver cmdline ioa = do
   let chromeConfig = useBrowser (chrome {chromeBinary = Just (cmdline^.chromeExecutable)}) defaultConfig
-  runSession chromeConfig getSession >>= ioa
+  bracket (runSession chromeConfig getSession) (\sess -> runWD sess closeSession) ioa
 
 withValidSeedCode :: Cmdline -> SQLite.Connection -> (Text -> IO a) -> IO a
 withValidSeedCode cmdline dbh ioa = do
