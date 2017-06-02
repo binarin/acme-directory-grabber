@@ -101,7 +101,7 @@ runDaily cmdline = do
         putStrLn $ show cookie
         info $ "Got cookie " <> cookie
         fetchTodaysDirectory config cookie
-        bool (return ()) (refreshBackupCodes config) (codesLeft == 0)
+        bool (return ()) (refreshBackupCodes config) (codesLeft < 5)
         return ()
 
 fetchBackupCodes :: Config -> WD [Text]
