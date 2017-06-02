@@ -7,6 +7,7 @@
 {-# LANGUAGE FunctionalDependencies #-}
 {-# LANGUAGE FlexibleInstances #-}
 
+import Data.Maybe
 import Control.Exception
 import qualified GHC.Word
 import Data.Time.Format
@@ -171,18 +172,16 @@ withWebDriver cmdline ioa = do
 
 withValidSeedCode :: Cmdline -> SQLite.Connection -> (Text -> IO a) -> IO a
 withValidSeedCode cmdline dbh ioa = do
-  case cmdline^.seedCode of
-    Just code ->
-      ioa code
-    Nothing -> do
-      codes :: [BackupCode] <- SQLite.query_ dbh "SELECT * from backup_codes where used = 0 limit 1"
-      case codes of
-        [codeObj] -> do
-          SQLite.execute dbh "update backup_codes set used = 1 where code = ?" (SQLite.Only $ codeObj^.code)
-          info $ "Marked code " <> (codeObj^.code) <> " as used"
-          ioa (codeObj^.code)
-        _ ->
-          error "No backup codes in the database, and none provided on command-line"
+  codes :: [BackupCode] <- SQLite.query_ dbh "SELECT * from backup_codes where used = 0 limit 1"
+  case codes  of
+    [codeObj] -> do
+      SQLite.execute dbh "update backup_codes set used = 1 where code = ?" (SQLite.Only $ codeObj^.code)
+      info $ "Marked code " <> (codeObj^.code) <> " as used"
+      ioa (codeObj^.code)
+    _ | cmdline^.seedCode /= Nothing ->
+      ioa $ fromJust $ cmdline^.seedCode
+    _ ->
+      error "No backup codes in the database, and none provided on command-line"
 
 withDatabase :: Cmdline -> (SQLite.Connection -> IO a) -> IO a
 withDatabase cmdline ioa = do
