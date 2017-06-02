@@ -108,18 +108,18 @@ fetchBackupCodes config = do
   openPage "https://myaccount.google.com/signinoptions/two-step-verification"
   passwordInput <- findElem $ ByName "password"
   sendKeys (config^.password) passwordInput
-  liftIO $ threadDelay 1000000
+  liftIO $ threadDelay 7000000
   nextButton <- findElem $ ById "passwordNext"
   click nextButton
   showCodesButton <- findElem $ ByXPath "//span[text()='Show codes']"
   click showCodesButton
-  liftIO $ threadDelay 1000000
+  liftIO $ threadDelay 7000000
   getNewCodesButton <- findElem $ ByXPath "//span[text()='Get new codes']"
   click getNewCodesButton
-  liftIO $ threadDelay 2000000
+  liftIO $ threadDelay 7000000
   okButton <- findElem $ ByXPath "(//span[.='OK'])[2]"
   click okButton
-  liftIO $ threadDelay 3000000
+  liftIO $ threadDelay 7000000
   codesTable <- findElem $ ByCSS "table"
   raw <- getText codesTable
   return $ filter (T.all isDigit) $ map (T.filter (/= ' ')) $ T.lines raw
