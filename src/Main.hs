@@ -7,6 +7,7 @@
 {-# LANGUAGE FunctionalDependencies #-}
 {-# LANGUAGE FlexibleInstances #-}
 
+import qualified GHC.Word
 import System.Environment (withArgs)
 import Control.Concurrent (threadDelay)
 import qualified Options.Applicative as Opt
@@ -24,6 +25,13 @@ import Control.Logging
 import TextShow
 import Data.Bool
 import Data.Char
+import Network.Wreq
+import qualified Data.ByteString.Lazy as BL
+import qualified Data.ByteString as B
+import qualified Data.ByteString.Char8 as C8
+import Data.Text.Encoding (encodeUtf8)
+import Text.Regex.PCRE
+import Data.Array (bounds, (!))
 
 data Cmdline = Cmdline { _cmdlineUser :: Text
                        , _cmdlinePassword :: Text
@@ -126,11 +134,29 @@ fetchTodaysDirectory :: Config -> Text -> IO ()
 fetchTodaysDirectory cfg rawCookie = do
   return ()
 
+extractToken :: Text -> B.ByteString
+extractToken token =
+  let matches = (T.unpack token) =~ ("DIRECTORY_TOKEN=([0-9a-f]+)" :: String) :: [MatchText String]
+  in case matches of
+      [match] -> C8.pack $ fst $ match ! 1
+      _ -> error "No directory token in cookie"
+
+fetchDirectory :: Config -> Text -> IO BL.ByteString
+fetchDirectory cfg rawCookie = do
+  let token = extractToken rawCookie
+  let opts = defaults & header "Cookie" .~ [encodeUtf8 rawCookie]
+                      & header "X-Directory-Token" .~ [token]
+      base = T.unpack $ cfg^.directoryUrl
+  r <- getWith opts (base <> "/api/employees")
+  let httpCode = r ^. responseStatus . statusCode
+  info $ "Fetching directory resulted in http code " <> showt httpCode
+  return $ r ^. responseBody
+
+
 countCodesLeft :: Config -> IO Int
 countCodesLeft config = do
   [[cnt]] <- SQLite.query_ (config^.dbh) "select count(*) from backup_codes where used = 0"
   return cnt
-
 
 withWebDriver :: Cmdline -> (WDSession -> IO a) -> IO a
 withWebDriver cmdline ioa = do
