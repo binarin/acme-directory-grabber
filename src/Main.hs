@@ -1,8 +1,11 @@
+{-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE DuplicateRecordFields #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE FunctionalDependencies #-}
+{-# LANGUAGE FlexibleInstances #-}
 
 import System.Environment (withArgs)
 import Control.Concurrent (threadDelay)
@@ -15,70 +18,163 @@ import System.FilePath
 import Test.WebDriver
 import Test.WebDriver.Session
 import Control.Monad.IO.Class
+import qualified Database.SQLite.Simple as SQLite
+import Control.Lens
+import Control.Logging
+import TextShow
+import Data.Bool
+import Data.Char
 
-data Cmdline = Cmdline { user :: Text
-                       , password :: Text
-                       , directoryUrl :: Text
-                       , seedCode :: Maybe Text
+data Cmdline = Cmdline { _cmdlineUser :: Text
+                       , _cmdlinePassword :: Text
+                       , _cmdlineDirectoryUrl :: Text
+                       , _cmdlineDatabaseFile :: FilePath
+                       , _cmdlineSeedCode :: Maybe Text
+                       , _cmdlineChromeExecutable :: FilePath
                        }
   deriving (Show)
+
+data Config = Config { _configUser :: Text
+                     , _configPassword :: Text
+                     , _configDirectoryUrl :: Text
+                     , _configSeedCode :: Text
+                     , _configWebDriver :: WDSession
+                     , _configDbh :: SQLite.Connection
+                     }
+
+
+
+data BackupCode = BackupCode { _backupCodeCode :: Text
+                             , _backupCodeUsed :: Bool
+                             }
+                  deriving (Show)
+
+makeFields ''Config
+makeFields ''Cmdline
+makeFields ''BackupCode
+
+instance SQLite.FromRow BackupCode where
+  fromRow = BackupCode <$> SQLite.field <*> SQLite.field
+
+instance SQLite.ToRow BackupCode where
+  toRow (BackupCode code used) = SQLite.toRow (code, bool 0 1 used :: Int)
 
 requiredTextOption name = OptT.textOption (Opt.long name <> Opt.noArgError (Opt.ErrorMsg "required") <> Opt.metavar ("<" <> name <> ">"))
 
 parseArgs :: Opt.Parser Cmdline
-parseArgs = Cmdline <$> userOpt <*> passwordOpt <*> urlOpt <*> seedCodeOpt
+parseArgs = Cmdline <$> userOpt <*> passwordOpt <*> urlOpt <*> dbOpt <*> seedCodeOpt <*> chromeBinaryOpt
   where
      userOpt = requiredTextOption "user"
      passwordOpt = requiredTextOption "password"
      urlOpt = requiredTextOption "url"
+     dbOpt = Opt.strOption  (Opt.long "db-file" <> Opt.value "./dp.sqlite")
+     chromeBinaryOpt = Opt.strOption (Opt.long "chrome" <> Opt.noArgError (Opt.ErrorMsg "required") <> Opt.metavar ("<chrome>"))
      seedCodeOpt = Opt.option (Just <$> OptT.text)
                               (  Opt.long "code"
                               <> Opt.value Nothing )
 
-main = runDaily =<< Opt.execParser (Opt.info parseArgs mempty)
+main = withStderrLogging $ runDaily =<< Opt.execParser (Opt.info parseArgs mempty)
 
-     -- need at least one valid backup code (either from cmdline, or stored in database)
-     -- fetch cookie, logging to google by the way
-     -- cache cookie in database
-     -- if there is not enough codes, refresh them (we are already logged to google to) and save to database
+info = Control.Logging.log
 
 runDaily :: Cmdline -> IO ()
-runDaily cfg = do
-  putStrLn $ show cfg
+runDaily cmdline = do
+  withDatabase cmdline $ \db -> do
+    withValidSeedCode cmdline db $ \code -> do
+      withWebDriver cmdline $ \session -> do
+        let config = Config (cmdline^.user) (cmdline^.password) (cmdline^.directoryUrl) code session db
+        codesLeft <- countCodesLeft config
+        info $ "We have " <> showt codesLeft <> " backup codes left"
+        cookie <- runWD session $ acquireSessionId config
+        putStrLn $ show cookie
+        info $ "Got cookie " <> cookie
+        fetchTodaysDirectory config cookie
+        bool (return ()) (refreshBackupCodes config) (codesLeft == 0)
+        return ()
+
+fetchBackupCodes :: Config -> WD [Text]
+fetchBackupCodes config = do
+  openPage "https://myaccount.google.com/signinoptions/two-step-verification"
+  passwordInput <- findElem $ ByName "password"
+  sendKeys (config^.password) passwordInput
+  liftIO $ threadDelay 1000000
+  nextButton <- findElem $ ById "passwordNext"
+  click nextButton
+  showCodesButton <- findElem $ ByXPath "//span[text()='Show codes']"
+  click showCodesButton
+  liftIO $ threadDelay 1000000
+  getNewCodesButton <- findElem $ ByXPath "//span[text()='Get new codes']"
+  click getNewCodesButton
+  liftIO $ threadDelay 2000000
+  okButton <- findElem $ ByXPath "(//span[.='OK'])[2]"
+  click okButton
+  liftIO $ threadDelay 3000000
+  codesTable <- findElem $ ByCSS "table"
+  raw <- getText codesTable
+  return $ filter (T.all isDigit) $ map (T.filter (/= ' ')) $ T.lines raw
+
+refreshBackupCodes :: Config -> IO ()
+refreshBackupCodes config = do
+  info "Will refresh backup codes"
+  codes <- runWD (config^.webDriver) $ fetchBackupCodes config
+  SQLite.execute_ (config^.dbh) "delete from backup_codes"
+  mapM_ (SQLite.execute (config^.dbh) "replace into backup_codes(code, used) values(?,?)" . (flip BackupCode False)) codes
+  info $ "Got new backup codes " <> showt codes
   return ()
 
+fetchTodaysDirectory :: Config -> Text -> IO ()
+fetchTodaysDirectory cfg rawCookie = do
+  return ()
 
-data BackupCode = BackupCode { code :: Text
-                             , used :: Bool
-                             }
-
-
-data Config = Config
-              { login :: Text
-              , password :: Text
-              , backupCode :: Text
-              }
-
-firefoxConfig :: WDConfig
-firefoxConfig = defaultConfig
-
-chromeConfig = useBrowser (chrome {chromeBinary = Just "/nix/store/aa7q0mgccyawh05qsqcd85mn65gxyzgn-google-chrome-beta-58.0.3029.68/bin/google-chrome-beta"}) defaultConfig
+countCodesLeft :: Config -> IO Int
+countCodesLeft config = do
+  [[cnt]] <- SQLite.query_ (config^.dbh) "select count(*) from backup_codes where used = 0"
+  return cnt
 
 
+withWebDriver :: Cmdline -> (WDSession -> IO a) -> IO a
+withWebDriver cmdline ioa = do
+  let chromeConfig = useBrowser (chrome {chromeBinary = Just (cmdline^.chromeExecutable)}) defaultConfig
+  runSession chromeConfig getSession >>= ioa
 
-fetchDirectory (Config{..}) =
-  runSession chromeConfig $ do
+withValidSeedCode :: Cmdline -> SQLite.Connection -> (Text -> IO a) -> IO a
+withValidSeedCode cmdline dbh ioa = do
+  case cmdline^.seedCode of
+    Just code ->
+      ioa code
+    Nothing -> do
+      codes :: [BackupCode] <- SQLite.query_ dbh "SELECT * from backup_codes where used = 0 limit 1"
+      case codes of
+        [codeObj] -> do
+          SQLite.execute dbh "update backup_codes set used = 1 where code = ?" (SQLite.Only $ codeObj^.code)
+          info $ "Marked code " <> (codeObj^.code) <> " as used"
+          ioa (codeObj^.code)
+        _ ->
+          error "No backup codes in the database, and none provided on command-line"
+
+withDatabase :: Cmdline -> (SQLite.Connection -> IO a) -> IO a
+withDatabase cmdline ioa = do
+  SQLite.withConnection (cmdline^.databaseFile) $ \conn -> do
+    ensureTables conn
+    ioa conn
+
+ensureTables :: SQLite.Connection -> IO ()
+ensureTables conn = do
+  SQLite.execute_ conn "CREATE TABLE IF NOT EXISTS backup_codes(code TEXT PRIMARY KEY, used NUMERIC NOT NULL)"
+
+acquireSessionId :: Config -> WD Text
+acquireSessionId cfg = do
     setImplicitWait 3000
-    openPage "YOU_SHOULD_KNOW"
+    openPage $ T.unpack $ cfg^.directoryUrl
     signinButton <- findElem $ ById "signinButton"
     click signinButton
     emailInput <- findElem $ ById "identifierId"
-    sendKeys login emailInput
+    sendKeys (cfg^.user) emailInput
     submit emailInput
     nextButton <- findElem $ ById "identifierNext"
     click nextButton
     passwordInput <- findElem $ ByName "password"
-    sendKeys password passwordInput
+    sendKeys (cfg^.password) passwordInput
     nextButton <- findElem $ ById "passwordNext"
     liftIO $ threadDelay 1000000
     click nextButton
@@ -87,11 +183,11 @@ fetchDirectory (Config{..}) =
     chooseBackupCodes <- findElem $ ByCSS "form[action=\"/signin/challenge/bc/4\"] button"
     click chooseBackupCodes
     backupCodeInput <- findElem $ ById "backupCodePin"
-    sendKeys backupCode backupCodeInput
+    sendKeys (cfg^.seedCode) backupCodeInput
     liftIO $ threadDelay 1000000
     submit backupCodeInput
     liftIO $ threadDelay 1000000
-    getSession
+    executeJS [] "return window.document.cookie"
 
-cont s = withSession s $ do
-     return 1
+-- cont s = withSession s $ do
+--      return 1
